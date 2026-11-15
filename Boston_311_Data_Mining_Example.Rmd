@@ -1,0 +1,378 @@
+---
+title: "Exploratory Data Mining with Boston 311 Open Data"
+author: "Prasanya Padmasha Tirupathy"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: readable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 8,
+  fig.height = 5,
+  dpi = 120,
+  dev = "svg"
+)
+
+# Run once if these packages are not installed:
+# install.packages(c("dplyr", "ggplot2", "arules", "arulesViz", "jsonlite", "knitr"))
+
+library(dplyr)
+library(ggplot2)
+library(arules)
+library(arulesViz)
+library(jsonlite)
+library(knitr)
+```
+
+## Introduction
+
+It explores Boston 311 service requests, compares request channels, visualizes service patterns, and uses association rule mining to find request reasons that commonly occur in the same neighborhood and week.
+
+**Data source:** City of Boston, [311 Service Requests](https://data.boston.gov/dataset/311-service-requests). This example uses the 2025 legacy-system resource (`9d7c2214-4709-478a-a2e8-fb2020a5bb94`). The analysis uses a reproducible sample rather than claiming to describe every 2025 request.
+
+## Part A: Data Exploration and Service-Request Profiling
+
+### 1. Download or load the data
+
+The code downloads the first 20,000 qualifying 2025 records from the City of Boston CKAN API. It saves a local copy so later runs do not need to download the sample again.
+
+```{r load-data}
+resource_id <- "9d7c2214-4709-478a-a2e8-fb2020a5bb94"
+sample_file <- "boston_311_2025_sample.csv"
+
+if (!file.exists(sample_file)) {
+  sql_query <- paste0(
+    "SELECT open_dt, closed_dt, on_time, case_status, subject, reason, ",
+    "type, department, neighborhood, source ",
+    "FROM \"", resource_id, "\" ",
+    "WHERE open_dt IS NOT NULL ",
+    "AND reason IS NOT NULL ",
+    "AND neighborhood IS NOT NULL ",
+    "AND reason <> '' ",
+    "AND neighborhood <> '' ",
+    "ORDER BY open_dt LIMIT 20000"
+  )
+
+  api_url <- paste0(
+    "https://data.boston.gov/api/3/action/datastore_search_sql?sql=",
+    URLencode(sql_query, reserved = TRUE)
+  )
+
+  response <- jsonlite::fromJSON(api_url)
+  if (!isTRUE(response$success)) {
+    stop("The City of Boston API did not return a successful response.")
+  }
+
+  boston311 <- response$result$records
+  write.csv(boston311, sample_file, row.names = FALSE)
+} else {
+  boston311 <- read.csv(sample_file, stringsAsFactors = FALSE)
+}
+
+names(boston311) <- c(
+  "OpenDateTime", "ClosedDateTime", "OnTime", "CaseStatus",
+  "Subject", "Reason", "RequestType", "Department",
+  "Neighborhood", "Source"
+)
+
+kable(head(boston311, 5), caption = "First five Boston 311 service requests")
+```
+
+### 2. Prepare and describe the data
+
+```{r prepare-data}
+parse_boston_time <- function(x) {
+  x <- sub("\\.[0-9]+$", "", x)
+  x[x == ""] <- NA_character_
+  as.POSIXct(x, format = "%Y-%m-%d %H:%M:%S", tz = "America/New_York")
+}
+
+boston311 <- boston311 |>
+  mutate(
+    OpenDateTime = parse_boston_time(OpenDateTime),
+    ClosedDateTime = parse_boston_time(ClosedDateTime),
+    OpenDate = as.Date(OpenDateTime),
+    ResolutionHours = as.numeric(
+      difftime(ClosedDateTime, OpenDateTime, units = "hours")
+    ),
+    OnTimeFlag = tolower(trimws(OnTime)) == "ontime"
+  )
+
+data_overview <- data.frame(
+  Measure = c(
+    "Sample records",
+    "Variables after preparation",
+    "First open date",
+    "Last open date",
+    "Neighborhoods",
+    "Request reasons",
+    "Request types",
+    "Closed requests with valid resolution time"
+  ),
+  Value = c(
+    nrow(boston311),
+    ncol(boston311),
+    as.character(min(boston311$OpenDate, na.rm = TRUE)),
+    as.character(max(boston311$OpenDate, na.rm = TRUE)),
+    n_distinct(boston311$Neighborhood),
+    n_distinct(boston311$Reason),
+    n_distinct(boston311$RequestType),
+    sum(!is.na(boston311$ResolutionHours) & boston311$ResolutionHours >= 0)
+  )
+)
+
+kable(data_overview, caption = "Boston 311 sample overview")
+```
+
+The variables describe three main areas:
+
+- **Time and performance:** `OpenDateTime`, `ClosedDateTime`, `OnTime`, `CaseStatus`, and `ResolutionHours`.
+- **Service classification:** `Subject`, `Reason`, `RequestType`, and `Department`.
+- **Location and access channel:** `Neighborhood` and `Source`.
+
+This dataset does not measure every service problem in Boston. It measures reported 311 requests, so neighborhoods or groups that use 311 more often may appear to have more problems even when reporting behavior is part of the difference.
+
+### 3. Compare request channels
+
+```{r source-summary}
+source_summary <- boston311 |>
+  group_by(Source) |>
+  summarise(
+    Requests = n(),
+    Neighborhoods = n_distinct(Neighborhood),
+    Reasons = n_distinct(Reason),
+    On_Time_Rate = mean(OnTimeFlag, na.rm = TRUE),
+    Median_Resolution_Hours = median(
+      ResolutionHours[ResolutionHours >= 0],
+      na.rm = TRUE
+    ),
+    .groups = "drop"
+  ) |>
+  arrange(desc(Requests))
+
+source_summary_display <- source_summary |>
+  mutate(
+    On_Time_Rate = sprintf("%.1f%%", 100 * On_Time_Rate),
+    Median_Resolution_Hours = round(Median_Resolution_Hours, 1)
+  )
+
+kable(source_summary_display, caption = "Service-request summary by source channel")
+```
+
+```{r top-reason-source}
+top_reason_by_source <- boston311 |>
+  count(Source, Reason, name = "Requests") |>
+  group_by(Source) |>
+  slice_max(Requests, n = 1, with_ties = TRUE) |>
+  arrange(Source, desc(Requests))
+
+kable(top_reason_by_source, caption = "Most common request reason by source channel")
+```
+
+**Reflection.** Request channels can serve different populations and purposes. A high request count does not automatically mean that a channel is better or that a neighborhood has greater service need. The source summary is most useful for understanding how residents and employees enter requests and whether performance measures differ across those channels.
+
+## Part B: Visualization and Pattern Relationships
+
+### 1. Most frequent request reasons
+
+```{r reason-frequency}
+top_reasons <- boston311 |>
+  count(Reason, name = "Requests") |>
+  slice_max(Requests, n = 10) |>
+  arrange(Requests)
+
+ggplot(top_reasons, aes(x = reorder(Reason, Requests), y = Requests)) +
+  geom_col(fill = "#2C7FB8") +
+  coord_flip() +
+  labs(
+    title = "Top 10 Reasons for Boston 311 Requests",
+    subtitle = "Sample of 20,000 qualifying records from the 2025 legacy dataset",
+    x = "Request reason",
+    y = "Number of requests",
+    caption = "Source: City of Boston 311 Service Requests"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+### 2. Request frequency by source channel
+
+```{r source-frequency}
+source_counts <- boston311 |>
+  count(Source, name = "Requests") |>
+  arrange(Requests)
+
+ggplot(source_counts, aes(x = reorder(Source, Requests), y = Requests)) +
+  geom_col(fill = "#41AB5D") +
+  coord_flip() +
+  labs(
+    title = "Boston 311 Requests by Source Channel",
+    x = "Source channel",
+    y = "Number of requests",
+    caption = "Source: City of Boston 311 Service Requests"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+### 3. Distribution of resolution time
+
+To keep the histogram readable, the chart shows nonnegative resolution times up to 30 days. The filter is only for this visualization; it does not change the source data.
+
+```{r resolution-histogram}
+resolution_plot_data <- boston311 |>
+  filter(
+    !is.na(ResolutionHours),
+    ResolutionHours >= 0,
+    ResolutionHours <= 24 * 30
+  )
+
+ggplot(resolution_plot_data, aes(x = ResolutionHours / 24)) +
+  geom_histogram(binwidth = 1, fill = "#756BB1", color = "white") +
+  geom_vline(
+    xintercept = median(resolution_plot_data$ResolutionHours) / 24,
+    linetype = "dashed",
+    color = "#CB181D",
+    linewidth = 0.8
+  ) +
+  labs(
+    title = "Distribution of 311 Resolution Time",
+    subtitle = "Closed requests resolved within 30 days; dashed line is the median",
+    x = "Resolution time (days)",
+    y = "Number of requests",
+    caption = "Source: City of Boston 311 Service Requests"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+### 4. On-time percentage by source channel
+
+```{r on-time-plot}
+on_time_plot <- source_summary |>
+  filter(!is.na(On_Time_Rate))
+
+ggplot(on_time_plot, aes(x = reorder(Source, On_Time_Rate), y = On_Time_Rate)) +
+  geom_col(fill = "#FD8D3C") +
+  coord_flip() +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    title = "On-Time Percentage by Request Source",
+    x = "Source channel",
+    y = "On-time percentage",
+    caption = "Source: City of Boston 311 Service Requests"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+**Management interpretation.** The frequency charts can help managers see which service areas generate the most reported demand and which channels receive the most requests. The resolution-time chart shows whether most cases close quickly or whether a smaller number of long cases extend the distribution. The on-time chart may help identify channels that need further review, but it should not be used alone to judge performance because request difficulty and service mix can differ by channel.
+
+## Part C: Association Rule Mining
+
+### 1. Create neighborhood-week baskets
+
+Retail market-basket analysis groups products purchased in the same transaction. For 311 data, this example defines a basket as the unique request reasons reported within one neighborhood during one calendar week. A rule therefore means that two service-request reasons often appear in the same neighborhood-week, not that one reason causes another.
+
+```{r prepare-baskets}
+basket_data <- boston311 |>
+  filter(
+    !is.na(OpenDate),
+    !is.na(Neighborhood),
+    Neighborhood != "",
+    !is.na(Reason),
+    Reason != ""
+  ) |>
+  mutate(
+    Week = as.Date(cut(OpenDate, breaks = "week", start.on.monday = TRUE)),
+    BasketID = paste(Neighborhood, Week, sep = " | ")
+  )
+
+neighborhood_week_baskets <- split(basket_data$Reason, basket_data$BasketID)
+neighborhood_week_baskets <- lapply(neighborhood_week_baskets, unique)
+neighborhood_week_baskets <- neighborhood_week_baskets[
+  lengths(neighborhood_week_baskets) >= 2
+]
+
+transactions <- as(neighborhood_week_baskets, "transactions")
+
+basket_summary <- data.frame(
+  Neighborhood_Week_Baskets = length(transactions),
+  Unique_Request_Reasons = ncol(transactions),
+  Average_Reasons_Per_Basket = mean(size(transactions))
+)
+
+kable(basket_summary, digits = 2, caption = "Neighborhood-week basket summary")
+```
+
+### 2. Run Apriori and report the top five rules
+
+The code tries a small sequence of support and confidence thresholds. It uses the first setting that produces at least five rules, making the example more robust if the City updates the underlying resource.
+
+```{r apriori-rules}
+thresholds <- data.frame(
+  Support = c(0.20, 0.15, 0.10, 0.05),
+  Confidence = c(0.70, 0.65, 0.60, 0.50)
+)
+
+rules <- NULL
+used_threshold <- NULL
+
+for (i in seq_len(nrow(thresholds))) {
+  candidate_rules <- apriori(
+    transactions,
+    parameter = list(
+      support = thresholds$Support[i],
+      confidence = thresholds$Confidence[i],
+      minlen = 2,
+      maxlen = 3,
+      target = "rules"
+    ),
+    control = list(verbose = FALSE)
+  )
+
+  candidate_rules <- candidate_rules[!is.redundant(candidate_rules)]
+
+  if (length(candidate_rules) >= 5) {
+    rules <- candidate_rules
+    used_threshold <- thresholds[i, ]
+    break
+  }
+}
+
+if (is.null(rules) || length(rules) < 5) {
+  stop("Fewer than five rules were found. Add more records or lower the thresholds.")
+}
+
+top_rules <- head(sort(rules, by = "lift", decreasing = TRUE), 5)
+
+top_rules_table <- data.frame(
+  Rule = labels(top_rules),
+  Support = quality(top_rules)$support,
+  Confidence = quality(top_rules)$confidence,
+  Lift = quality(top_rules)$lift,
+  Count = quality(top_rules)$count
+) |>
+  mutate(
+    Support = sprintf("%.1f%%", 100 * Support),
+    Confidence = sprintf("%.1f%%", 100 * Confidence),
+    Lift = round(Lift, 2)
+  )
+
+kable(used_threshold, caption = "Apriori thresholds used")
+kable(top_rules_table, caption = "Top five association rules ranked by lift")
+```
+
+### 3. Visualize the association rules
+
+```{r rule-plot, fig.height=6}
+plot(top_rules, method = "grouped")
+```
+
+### 4. Public-service reflection
+
+Association rules can help city managers identify service needs that often occur together in the same place and week. Related patterns could support coordinated inspections, shared field visits, or combined maintenance planning. These rules should remain exploratory. They are sensitive to the basket definition, sample period, reporting behavior, and category system. Before changing staffing or budgets, the City should repeat the analysis with the full dataset, compare multiple time periods, and consult departments and affected neighborhoods.
+

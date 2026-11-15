@@ -1,0 +1,17 @@
+# Downloaded and generated data
+boston_311_2025_sample.csv
+
+# Verification and rendered output
+verification.md
+*.html
+*_files/
+
+# R and RStudio temporary files
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+
+# Operating system files
+.DS_Store
+Thumbs.db
